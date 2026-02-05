@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 import torch
 
+"""
+Context 全局变量
+  减少模块间依赖
+"""
 
 @dataclass
 class Context:

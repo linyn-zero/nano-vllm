@@ -60,7 +60,7 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
     ):
         tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        super().__init__(input_size, divide(output_size, tp_size), bias, 0)  # torch 列优先，tp_dim=0 即为列维度
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data

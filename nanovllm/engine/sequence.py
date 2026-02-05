@@ -4,6 +4,9 @@ from itertools import count
 
 from nanovllm.sampling_params import SamplingParams
 
+"""
+Sequence 请求
+"""
 
 class SequenceStatus(Enum):
     WAITING = auto()
@@ -11,8 +14,8 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
-class Sequence:
-    block_size = 256
+class Sequence: 
+    block_size = 256  # [python grammar] class attributes, shared by all instances
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
@@ -23,7 +26,7 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.block_table = []
+        self.block_table = []  # block_ids (cache block address)
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -34,7 +37,7 @@ class Sequence:
     def __getitem__(self, key):
         return self.token_ids[key]
 
-    @property
+    @property  # “动态”属性
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
 

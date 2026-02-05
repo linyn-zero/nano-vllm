@@ -6,14 +6,17 @@ from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
+    """
+    schedule sequences
+    """
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
-        self.waiting: deque[Sequence] = deque()
-        self.running: deque[Sequence] = deque()
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)  # Sequence 的资源抽象底层（文件系统）
+        self.waiting: deque[Sequence] = deque()  # prefill
+        self.running: deque[Sequence] = deque()  # decode
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -45,7 +48,7 @@ class Scheduler:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
-                    self.preempt(self.running.pop())
+                    self.preempt(self.running.pop())  # 释放缓存块资源
                 else:
                     self.preempt(seq)
                     break
@@ -54,7 +57,7 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
+        self.running.extendleft(reversed(scheduled_seqs))  # recover self.running
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):

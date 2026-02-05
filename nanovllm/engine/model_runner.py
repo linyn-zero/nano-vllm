@@ -1,6 +1,6 @@
 import pickle
 import torch
-import torch.distributed as dist
+import torch.distributed as dist  # GPU 间通信：通过 共享内存
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -11,7 +11,7 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
-
+# 每个 GPU 都有自己的 ModelRunner 进程
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -28,11 +28,11 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
+        self.model = Qwen3ForCausalLM(hf_config)   # 初始化模型
+        load_model(self.model, config.model)  # 加载模型权重
+        self.sampler = Sampler()  
+        self.warmup_model()  # 预热模型获取运行信息
+        self.allocate_kv_cache()  # 向 cuda 申请 kvcache 资源
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -60,14 +60,14 @@ class ModelRunner:
 
     def loop(self):
         while True:
-            method_name, args = self.read_shm()
+            method_name, args = self.read_shm()  # 通过 共享内存 进行 RPC
             self.call(method_name, *args)
             if method_name == "exit":
                 break
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
+        self.event.wait()  # 锁
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
@@ -75,28 +75,30 @@ class ModelRunner:
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
+        data = pickle.dumps([method_name, *args])  # 二进制序列化
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
 
+    # API for multi-GPU to call other member method （常用于分布式计算场景）
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+            self.write_shm(method_name, *args)  # 通知子进程干活
         method = getattr(self, method_name, None)
         return method(*args)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len  # 16384，4096
+        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)  # min(4,512)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
+    # 为每一个 GPU 预先分配 kv cahce memory
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
@@ -109,9 +111,12 @@ class ModelRunner:
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)  # 申请 GPU 内存资源
         layer_id = 0
-        for module in self.model.modules():
+        # print("self.model.modules()=") if self.rank == 0 else print()
+        for module in self.model.modules():  # 递归地遍历 Qwen3ForCausalLM 中的nn.Module
+            # print(module) if self.rank == 0 else print()
+            # 将 GPU 内存资源分配给 model 实例的 Attn module 的 kv cache 参数中
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
@@ -126,11 +131,11 @@ class ModelRunner:
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
-        cu_seqlens_q = [0]
+        cu_seqlens_q = [0]  # 累计长度
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
+        slot_mapping = []  # 映射到 block_manager 的块资源
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
@@ -150,7 +155,7 @@ class ModelRunner:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+                slot_mapping.extend(list(range(start, end)))  
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -190,8 +195,8 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
+        else:  # 启用 cuda graph 的 decode
+            bs = input_ids.size(0)      
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
@@ -225,7 +230,7 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))  # ？
         self.graphs = {}
         self.graph_pool = None
 

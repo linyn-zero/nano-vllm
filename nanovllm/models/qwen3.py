@@ -96,12 +96,12 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(  # 列 TP
             hidden_size,
-            [intermediate_size] * 2,
+            [intermediate_size] * 2,  # merge gate_proj and up_proj
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowParallelLinear(  # 行 TP
             intermediate_size,
             hidden_size,
             bias=False,
@@ -166,7 +166,7 @@ class Qwen3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])  # 28 layers
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -182,7 +182,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class Qwen3ForCausalLM(nn.Module): 
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -199,7 +199,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+            self.lm_head.weight.data = self.model.embed_tokens.weight.data  # 共用权重
 
     def forward(
         self,
@@ -213,3 +213,32 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+"""
+model.modules()=
+Qwen3ForCausalLM(
+  (model): Qwen3Model(
+    (embed_tokens): VocabParallelEmbedding()    TP规约 reduce
+    (layers): ModuleList(
+      (0-27): 28 x Qwen3DecoderLayer(
+        (self_attn): Qwen3Attention(
+          (qkv_proj): QKVParallelLinear()
+          (o_proj): RowParallelLinear()         TP规约 reduce
+          (rotary_emb): RotaryEmbedding()
+          (attn): Attention()
+          (q_norm): RMSNorm()
+          (k_norm): RMSNorm()
+        )
+        (mlp): Qwen3MLP(
+          (gate_up_proj): MergedColumnParallelLinear()
+          (down_proj): RowParallelLinear()      TP规约 reduce
+          (act_fn): SiluAndMul()
+        )
+        (input_layernorm): RMSNorm()
+        (post_attention_layernorm): RMSNorm()
+      )
+    )
+    (norm): RMSNorm()
+  )
+  (lm_head): ParallelLMHead()                   TP规约 gather
+)
+"""
